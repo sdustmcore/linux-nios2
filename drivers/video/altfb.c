@@ -15,18 +15,6 @@
 #include <linux/fb.h>
 #include <linux/init.h>
 
-#if defined(CONFIG_ALTERA_NEEK_C3)
-#define SGDMABASE LCD_SGDMA_BASE	/* Altera Video Sync Generator */
-#define XRES 800
-#define YRES 480
-#define BPX  32
-#else
-#define VGABASE VGA_CONTROLLER_0_BASE	/* Altera VGA controller */
-#define XRES 640
-#define YRES 480
-#define BPX  16
-#endif
-
 /*
  *  RAM we reserve for the frame buffer. This defines the maximum screen
  *  size
@@ -34,34 +22,17 @@
  *  The default can be overridden if the driver is compiled as a module
  */
 
-#define VIDEOMEMSIZE	(XRES * YRES * (BPX>>3))
-
-static struct fb_var_screeninfo altfb_default __initdata = {
-	.xres = XRES,
-	.yres = YRES,
-	.xres_virtual = XRES,
-	.yres_virtual = YRES,
-	.bits_per_pixel = BPX,
-#if (BPX == 16)
-	.red = {11, 5, 0},
-	.green = {5, 6, 0},
-	.blue = {0, 5, 0},
-#else /* BXP == 16 or BXP == 32 */
-	.red = {16, 8, 0},
-	.green = {8, 8, 0},
-	.blue = {0, 8, 0},
-#endif
+static struct fb_var_screeninfo altfb_default __devinitdata = {
 	.activate = FB_ACTIVATE_NOW,
 	.height = -1,
 	.width = -1,
 	.vmode = FB_VMODE_NONINTERLACED,
 };
 
-static struct fb_fix_screeninfo altfb_fix __initdata = {
+static struct fb_fix_screeninfo altfb_fix __devinitdata = {
 	.id = "altfb",
 	.type = FB_TYPE_PACKED_PIXELS,
 	.visual = FB_VISUAL_TRUECOLOR,
-	.line_length = (XRES * (BPX >> 3)),
 	.accel = FB_ACCEL_NONE,
 };
 
@@ -76,25 +47,27 @@ static int altfb_setcolreg(unsigned regno, unsigned red, unsigned green,
 
 	if (regno > 255)
 		return 1;
-#if (BPX == 16)
-	red >>= 11;
-	green >>= 10;
-	blue >>= 11;
 
-	if (regno < 255) {
-		((u32 *) info->pseudo_palette)[regno] = ((red & 31) << 11) |
-		    ((green & 63) << 5) | (blue & 31);
-	}
-#else
-	red >>= 8;
-	green >>= 8;
-	blue >>= 8;
+    if(info->var.bits_per_pixel == 16) {
+	    red >>= 11;
+	    green >>= 10;
+	    blue >>= 11;
 
-	if (regno < 255) {
-		((u32 *) info->pseudo_palette)[regno] = ((red & 255) << 16) |
-		    ((green & 255) << 8) | (blue & 255);
-	}
-#endif
+	    if (regno < 255) {
+		    ((u32 *) info->pseudo_palette)[regno] = ((red & 31) << 11) |
+		        ((green & 63) << 5) | (blue & 31);
+	    }
+    } else {
+	    red >>= 8;
+	    green >>= 8;
+	    blue >>= 8;
+
+	    if (regno < 255) {
+		    ((u32 *) info->pseudo_palette)[regno] = ((red & 255) << 16) |
+		        ((green & 255) << 8) | (blue & 255);
+	    }
+    }
+
 	return 0;
 }
 
@@ -109,8 +82,6 @@ static struct fb_ops altfb_ops = {
 /*
  *  Initialization
  */
-
-#ifdef SGDMABASE
 
 #define ALTERA_SGDMA_IO_EXTENT 0x400
 
@@ -154,11 +125,9 @@ struct sgdma_desc {
 
 } __attribute__ ((packed));
 
-static int __init altfb_dma_start(unsigned long start, unsigned long len,
+static int __init altfb_dma_start(unsigned long base, unsigned long start, unsigned long len,
 				  void *descp)
 {
-	unsigned long base =
-	    (unsigned long)ioremap(SGDMABASE, ALTERA_SGDMA_IO_EXTENT);
 	unsigned long first_desc_phys = start + len;
 	unsigned long next_desc_phys = first_desc_phys;
 	struct sgdma_desc *desc = descp;
@@ -191,21 +160,6 @@ static int __init altfb_dma_start(unsigned long start, unsigned long len,
 	       base + ALTERA_SGDMA_CONTROL);	/* start */
 	return 0;
 }
-#else
-
-#define DISPLAY_DESC_SIZE(len) 0
-
-static int __init altfb_dma_start(unsigned long start, unsigned long len,
-				  void *descp)
-{
-	unsigned long base = ioremap(VGABASE, 16);
-	writel(0x0, base + 0);	/* Reset the VGA controller */
-	writel(start, base + 4);	/* Where our frame buffer starts */
-	writel(len, base + 8);	/* buffer size */
-	writel(0x1, base + 0);	/* Set the go bit */
-	return 0;
-}
-#endif
 
 	/* R   G   B */
 #define COLOR_WHITE	{204, 204, 204}
@@ -238,74 +192,123 @@ static struct bar_std __initdata bars[] = {
 	 }
 };
 
-#if (BPX == 16)
 static void __init altfb_color_bar(struct fb_info *info)
 {
-	unsigned short *p = (void *)info->screen_base;
+	unsigned short *p16 = (void *)info->screen_base;
+	unsigned *p32 = (void *)info->screen_base;
 	unsigned xres = info->var.xres;
 	unsigned xbar = xres / 8;
 	unsigned yres = info->var.yres;
 	unsigned x, y, i;
 	for (y = 0; y < yres; y++) {
 		for (i = 0; i < 8; i++) {
-			unsigned short d;
-			d = bars[0].bar[i][2] >> 3;
-			d |= (bars[0].bar[i][1] << 2) & 0x7e0;
-			d |= (bars[0].bar[i][0] << 8) & 0xf800;
-			for (x = 0; x < xbar; x++)
-				*p++ = d;
+		    if(info->var.bits_per_pixel == 16) {
+			    unsigned short d;
+			    d = bars[0].bar[i][2] >> 3;
+			    d |= (bars[0].bar[i][1] << 2) & 0x7e0;
+			    d |= (bars[0].bar[i][0] << 8) & 0xf800;
+			    for (x = 0; x < xbar; x++)
+				    *p16++ = d;
+		    } else {
+			    unsigned d;
+			    d = bars[0].bar[i][2];
+			    d |= bars[0].bar[i][1] << 8;
+			    d |= bars[0].bar[i][0] << 16;
+			    for (x = 0; x < xbar; x++)
+				    *p32++ = d;
+		    }
 		}
 	}
 }
-#else
-static void __init altfb_color_bar(struct fb_info *info)
-{
-	unsigned *p = (void *)info->screen_base;
-	unsigned xres = info->var.xres;
-	unsigned xbar = xres / 8;
-	unsigned yres = info->var.yres;
-	unsigned x, y, i;
-	for (y = 0; y < yres; y++) {
-		for (i = 0; i < 8; i++) {
-			unsigned d;
-			d = bars[0].bar[i][2];
-			d |= bars[0].bar[i][1] << 8;
-			d |= bars[0].bar[i][0] << 16;
-			for (x = 0; x < xbar; x++)
-				*p++ = d;
-		}
-	}
-}
-#endif
 
-static int __init altfb_probe(struct platform_device *dev)
+static int __devinit altfb_probe(struct platform_device *pdev)
 {
 	struct fb_info *info;
+	struct resource *res;
 	int retval = -ENOMEM;
 	void *fbmem_virt;
 	u8 *desc_virt;
+	const __be32* val;
+	void *sgdma_base;
 
-	/* sgdma descriptor table is located at the end of display memory */
-	fbmem_virt = dma_alloc_coherent(NULL,
-					VIDEOMEMSIZE +
-					DISPLAY_DESC_SIZE(VIDEOMEMSIZE),
-					(void *)&altfb_fix.smem_start,
-					GFP_KERNEL);
-	if (!fbmem_virt) {
-		printk(KERN_ERR "altfb: unable to allocate %ld Bytes fb memory\n",
-		       VIDEOMEMSIZE + DISPLAY_DESC_SIZE(VIDEOMEMSIZE));
-		return -ENOMEM;
-	}
-	altfb_fix.smem_len = VIDEOMEMSIZE;
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+	    return -ENODEV;
 
-	info = framebuffer_alloc(sizeof(u32) * 256, &dev->dev);
+	info = framebuffer_alloc(sizeof(u32) * 256, &pdev->dev);
 	if (!info)
 		goto err;
 
-	info->screen_base = fbmem_virt;
 	info->fbops = &altfb_ops;
 	info->var = altfb_default;
+
+	val = of_get_property(pdev->dev.of_node, "width", NULL);
+	if (!val) {
+		dev_err(&pdev->dev, "Missing required parameter 'width'");
+		return -ENODEV;
+	}
+
+	info->var.xres = be32_to_cpup(val),
+	info->var.xres_virtual = info->var.xres,
+
+	val = of_get_property(pdev->dev.of_node, "height", NULL);
+	if (!val) {
+		dev_err(&pdev->dev, "Missing required parameter 'height'");
+		return -ENODEV;
+	}
+
+	info->var.yres = be32_to_cpup(val);
+	info->var.yres_virtual = info->var.yres;
+
+	val = of_get_property(pdev->dev.of_node, "bpp", NULL);
+	if (!val) {
+		dev_err(&pdev->dev, "Missing required parameter 'bpp'");
+		return -ENODEV;
+	}
+
+	info->var.bits_per_pixel = be32_to_cpup(val);
+	if(info->var.bits_per_pixel == 24) {
+		dev_info(&pdev->dev, "BPP is set to 24. Using 32 to align to 16bit addresses");
+		info->var.bits_per_pixel = 32;
+	}
+	if(info->var.bits_per_pixel == 16) {
+		info->var.red.offset = 11;
+		info->var.red.length = 5;
+		info->var.red.msb_right = 0;
+		info->var.green.offset = 5;
+		info->var.green.length = 6;
+		info->var.green.msb_right = 0;
+		info->var.blue.offset = 0;
+		info->var.blue.length = 5;
+		info->var.blue.msb_right = 0;
+	} else {
+		info->var.red.offset = 16;
+		info->var.red.length = 8;
+		info->var.red.msb_right = 0;
+		info->var.green.offset = 8;
+		info->var.green.length = 8;
+		info->var.green.msb_right = 0;
+		info->var.blue.offset = 0;
+		info->var.blue.length = 8;
+		info->var.blue.msb_right = 0;
+	}
 	info->fix = altfb_fix;
+	info->fix.line_length = (info->var.xres * (info->var.bits_per_pixel >> 3));
+	info->fix.smem_len = info->fix.line_length * info->var.yres;
+
+	/* sgdma descriptor table is located at the end of display memory */
+	fbmem_virt = dma_alloc_coherent(NULL,
+					info->fix.smem_len +
+					DISPLAY_DESC_SIZE(info->fix.smem_len),
+					(void *)&(info->fix.smem_start),
+					GFP_KERNEL);
+	if (!fbmem_virt) {
+		dev_err(&pdev->dev, "altfb: unable to allocate %ld Bytes fb memory\n",
+			info->fix.smem_len + DISPLAY_DESC_SIZE(info->fix.smem_len));
+		return -ENOMEM;
+	}
+
+	info->screen_base = fbmem_virt;
 	info->pseudo_palette = info->par;
 	info->par = NULL;
 	info->flags = FBINFO_FLAG_DEFAULT;
@@ -314,22 +317,38 @@ static int __init altfb_probe(struct platform_device *dev)
 	if (retval < 0)
 		goto err1;
 
-	retval = register_framebuffer(info);
-	if (retval < 0)
-		goto err2;
-	platform_set_drvdata(dev, info);
+	platform_set_drvdata(pdev, info);
 
 	desc_virt = fbmem_virt;
-	desc_virt += altfb_fix.smem_len;
-	if (altfb_dma_start
-	    (altfb_fix.smem_start, altfb_fix.smem_len, desc_virt))
+	desc_virt += info->fix.smem_len;
+
+	if (!request_mem_region(res->start, resource_size(res), pdev->name)) {
+		dev_err(&pdev->dev, "Memory region busy\n");
+		retval = -EBUSY;
 		goto err2;
+	}
+	sgdma_base = ioremap_nocache(res->start, resource_size(res));
+	if(!sgdma_base) {
+		retval = -EIO;
+		goto err3;
+	}
+	if (altfb_dma_start((unsigned long)sgdma_base, info->fix.smem_start, info->fix.smem_len, desc_virt))
+		goto err4;
+	iounmap(sgdma_base);
+	release_region(res->start, resource_size(res));
 
 	printk(KERN_INFO "fb%d: %s frame buffer device at 0x%x+0x%x\n",
-	       info->node, info->fix.id, (unsigned)altfb_fix.smem_start,
-	       altfb_fix.smem_len);
+		info->node, info->fix.id, (unsigned)info->fix.smem_start,
+		info->fix.smem_len);
 	altfb_color_bar(info);
+	retval = register_framebuffer(info);
+	if (retval < 0)
+		goto err4;
 	return 0;
+err4:
+	iounmap(sgdma_base);
+err3:
+	release_region(res->start, resource_size(res));
 err2:
 	fb_dealloc_cmap(&info->cmap);
 err1:
@@ -340,7 +359,7 @@ err:
 	return retval;
 }
 
-static int altfb_remove(struct platform_device *dev)
+static int __devexit altfb_remove(struct platform_device *dev)
 {
 	struct fb_info *info = platform_get_drvdata(dev);
 
@@ -353,41 +372,24 @@ static int altfb_remove(struct platform_device *dev)
 	return 0;
 }
 
+static struct of_device_id altfb_match[] = {
+	{ .compatible = "ALTR,altfb-12.1", },
+	{ .compatible = "ALTR,altfb-1.0", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, altfb_match);
+
 static struct platform_driver altfb_driver = {
 	.probe = altfb_probe,
-	.remove = altfb_remove,
+	.remove = __devexit_p(altfb_remove),
 	.driver = {
-		   .name = "altfb",
-		   },
+	    .owner = THIS_MODULE,
+		.name = "altfb",
+		.of_match_table = altfb_match,
+    },
 };
 
-static struct platform_device altfb_device = {
-	.name = "altfb",
-	.id = 0,
-};
-
-static int __init altfb_init(void)
-{
-	int ret = 0;
-
-	ret = platform_driver_register(&altfb_driver);
-
-	if (!ret) {
-		ret = platform_device_register(&altfb_device);
-		if (ret)
-			platform_driver_unregister(&altfb_driver);
-	}
-	return ret;
-}
-
-static void __exit altfb_exit(void)
-{
-	platform_device_unregister(&altfb_device);
-	platform_driver_unregister(&altfb_driver);
-}
-
-module_init(altfb_init);
-module_exit(altfb_exit);
+module_platform_driver(altfb_driver);
 
 MODULE_DESCRIPTION("Altera framebuffer driver");
 MODULE_AUTHOR("Thomas Chou <thomas@wytron.com.tw>");
