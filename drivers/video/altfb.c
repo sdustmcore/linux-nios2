@@ -15,6 +15,25 @@
 #include <linux/fb.h>
 #include <linux/init.h>
 
+
+struct altfb_type;
+
+struct altfb_dev {
+    struct altfb_type *type;
+    struct platform_device *pdev;
+    struct fb_info *info;
+    struct resource *reg_res;
+    void __iomem *base;
+    void *priv;
+};
+
+struct altfb_type {
+    const char *name;
+    int (*of_setup)(struct altfb_dev *fbdev);
+    int (*start_hw)(struct altfb_dev *fbdev);
+};
+
+
 /*
  *  RAM we reserve for the frame buffer. This defines the maximum screen
  *  size
@@ -80,9 +99,43 @@ static struct fb_ops altfb_ops = {
 };
 
 /*
- *  Initialization
+ *  Initialization - SGDMA Based
  */
+static int of_setup_sgdma(struct altfb_dev *fbdev)
+{
+	const __be32* val;
 
+	val = of_get_property(fbdev->pdev->dev.of_node, "width", NULL);
+	if (!val) {
+		dev_err(&fbdev->pdev->dev, "Missing required parameter 'width'");
+		return -ENODEV;
+	}
+
+	fbdev->info->var.xres = be32_to_cpup(val),
+	fbdev->info->var.xres_virtual = fbdev->info->var.xres,
+
+	val = of_get_property(fbdev->pdev->dev.of_node, "height", NULL);
+	if (!val) {
+		dev_err(&fbdev->pdev->dev, "Missing required parameter 'height'");
+		return -ENODEV;
+	}
+
+	fbdev->info->var.yres = be32_to_cpup(val);
+	fbdev->info->var.yres_virtual = fbdev->info->var.yres;
+
+	val = of_get_property(fbdev->pdev->dev.of_node, "bpp", NULL);
+	if (!val) {
+		dev_err(&fbdev->pdev->dev, "Missing required parameter 'bpp'");
+		return -ENODEV;
+	}
+
+	fbdev->info->var.bits_per_pixel = be32_to_cpup(val);
+	if(fbdev->info->var.bits_per_pixel == 24) {
+		dev_info(&fbdev->pdev->dev, "BPP is set to 24. Using 32 to align to 16bit addresses");
+		fbdev->info->var.bits_per_pixel = 32;
+	}
+	return 0;
+}
 #define ALTERA_SGDMA_IO_EXTENT 0x400
 
 #define ALTERA_SGDMA_STATUS 0
@@ -125,20 +178,27 @@ struct sgdma_desc {
 
 } __attribute__ ((packed));
 
-static int __init altfb_dma_start(unsigned long base, unsigned long start, unsigned long len,
-				  void *descp)
-{
-	unsigned long first_desc_phys = start + len;
-	unsigned long next_desc_phys = first_desc_phys;
-	struct sgdma_desc *desc = descp;
+static int start_sgdma_hw(struct altfb_dev *fbdev) {
+	unsigned long first_desc_phys, next_desc_phys;
 	unsigned ctrl = ALTERA_SGDMA_DESCRIPTOR_CONTROL_OWNED_BY_HW_MSK;
-
+    unsigned long start = fbdev->info->fix.smem_start;
+    unsigned long len = fbdev->info->fix.smem_len;
+    struct sgdma_desc *desc;
+	struct sgdma_desc *descp = dma_alloc_coherent(NULL,
+					DISPLAY_DESC_SIZE(fbdev->info->fix.smem_len),
+					(void*)&first_desc_phys, GFP_KERNEL);
+    if(!descp) {
+        dev_err(&fbdev->pdev->dev, "Failed to allocate SGDMA descriptor memory\n");
+        return -ENOMEM;
+    }
 	writel(ALTERA_SGDMA_CONTROL_SOFTWARERESET_MSK, \
-	       base + ALTERA_SGDMA_CONTROL);	/* halt current transfer */
-	writel(0, base + ALTERA_SGDMA_CONTROL);	/* disable interrupts */
-	writel(0xff, base + ALTERA_SGDMA_STATUS);	/* clear status */
-	writel(first_desc_phys, base + ALTERA_SGDMA_NEXT_DESC_POINTER);
+	       fbdev->base + ALTERA_SGDMA_CONTROL);	/* halt current transfer */
+	writel(0, fbdev->base + ALTERA_SGDMA_CONTROL);	/* disable interrupts */
+	writel(0xff, fbdev->base + ALTERA_SGDMA_STATUS);	/* clear status */
+	writel(first_desc_phys, fbdev->base + ALTERA_SGDMA_NEXT_DESC_POINTER);
 
+    next_desc_phys = first_desc_phys;
+    desc = descp;    
 	while (len) {
 		unsigned long cc = min(len, DISPLAY_BYTES_PER_DESC);
 		next_desc_phys += sizeof(struct sgdma_desc);
@@ -157,120 +217,143 @@ static int __init altfb_dma_start(unsigned long base, unsigned long start, unsig
 	desc = descp;
 	desc->control = ctrl | ALTERA_SGDMA_DESCRIPTOR_CONTROL_GENERATE_SOP_MSK;
 	writel(ALTERA_SGDMA_CONTROL_RUN_MSK | ALTERA_SGDMA_CONTROL_PARK_MSK, \
-	       base + ALTERA_SGDMA_CONTROL);	/* start */
+	       fbdev->base + ALTERA_SGDMA_CONTROL);	/* start */
 	return 0;
 }
+/*
+ *  Initialization - VIPFrameReader Based
+ */
 
-	/* R   G   B */
-#define COLOR_WHITE	{204, 204, 204}
-#define COLOR_AMBAR	{208, 208,   0}
-#define COLOR_CIAN	{  0, 206, 206}
-#define	COLOR_GREEN	{  0, 239,   0}
-#define COLOR_MAGENTA	{239,   0, 239}
-#define COLOR_RED	{205,   0,   0}
-#define COLOR_BLUE	{  0,   0, 255}
-#define COLOR_BLACK	{  0,   0,   0}
+#define PACKET_BANK_ADDRESSOFFSET 12
+#define PB0_BASE_ADDRESSOFFSET 16
+#define PB0_WORDS_ADDRESSOFFSET 20
+#define PB0_SAMPLES_ADDRESSOFFSET 24
+#define PB0_WIDTH_ADDRESSOFFSET 32
+#define PB0_HEIGHT_ADDRESSOFFSET 36
+#define PB0_INTERLACED_ADDRESSOFFSET 40
 
-struct bar_std {
-	u8 bar[8][3];
-};
+#define VIPFR_GO 0
 
-/* Maximum number of bars are 10 - otherwise, the input print code
-   should be modified */
-static struct bar_std __initdata bars[] = {
-	{			/* Standard ITU-R color bar sequence */
-	 {
-	  COLOR_WHITE,
-	  COLOR_AMBAR,
-	  COLOR_CIAN,
-	  COLOR_GREEN,
-	  COLOR_MAGENTA,
-	  COLOR_RED,
-	  COLOR_BLUE,
-	  COLOR_BLACK,
-	  }
-	 }
-};
+static int of_setup_vipfr(struct altfb_dev *fbdev) {
+	const __be32* val;
 
-static void __init altfb_color_bar(struct fb_info *info)
-{
-	unsigned short *p16 = (void *)info->screen_base;
-	unsigned *p32 = (void *)info->screen_base;
-	unsigned xres = info->var.xres;
-	unsigned xbar = xres / 8;
-	unsigned yres = info->var.yres;
-	unsigned x, y, i;
-	for (y = 0; y < yres; y++) {
-		for (i = 0; i < 8; i++) {
-		    if(info->var.bits_per_pixel == 16) {
-			    unsigned short d;
-			    d = bars[0].bar[i][2] >> 3;
-			    d |= (bars[0].bar[i][1] << 2) & 0x7e0;
-			    d |= (bars[0].bar[i][0] << 8) & 0xf800;
-			    for (x = 0; x < xbar; x++)
-				    *p16++ = d;
-		    } else {
-			    unsigned d;
-			    d = bars[0].bar[i][2];
-			    d |= bars[0].bar[i][1] << 8;
-			    d |= bars[0].bar[i][0] << 16;
-			    for (x = 0; x < xbar; x++)
-				    *p32++ = d;
-		    }
-		}
+	val = of_get_property(fbdev->pdev->dev.of_node, "max-width", NULL);
+	if (!val) {
+		dev_err(&fbdev->pdev->dev, "Missing required parameter 'max-width'");
+		return -ENODEV;
 	}
+
+	fbdev->info->var.xres = be32_to_cpup(val),
+	fbdev->info->var.xres_virtual = fbdev->info->var.xres,
+
+	val = of_get_property(fbdev->pdev->dev.of_node, "max-height", NULL);
+	if (!val) {
+		dev_err(&fbdev->pdev->dev, "Missing required parameter 'max-height'");
+		return -ENODEV;
+	}
+
+	fbdev->info->var.yres = be32_to_cpup(val);
+	fbdev->info->var.yres_virtual = fbdev->info->var.yres;
+
+	val = of_get_property(fbdev->pdev->dev.of_node, "bits-per-color", NULL);
+	if (!val) {
+		dev_err(&fbdev->pdev->dev, "Missing required parameter 'bits-per-color'");
+		return -ENODEV;
+	}
+
+	fbdev->info->var.bits_per_pixel = be32_to_cpup(val);
+	if(be32_to_cpup(val) != 8) {
+		dev_err(&fbdev->pdev->dev, "bits-per-color is set to %i. Curently only 8 is supported.",be32_to_cpup(val));
+		return -ENODEV;
+	}
+	fbdev->info->var.bits_per_pixel = 32;
+
+	val = of_get_property(fbdev->pdev->dev.of_node, "mem-word-width", NULL);
+	if (!val) {
+		dev_err(&fbdev->pdev->dev, "Missing required parameter 'mem-word-width'");
+		return -ENODEV;
+	}
+	if(be32_to_cpup(val) != 32) {
+		dev_err(&fbdev->pdev->dev, "mem-word-width is set to %i. Curently only 32 is supported.",be32_to_cpup(val));
+		return -ENODEV;
+	}
+
+	return 0;
 }
+static int start_vipfr_hw(struct altfb_dev *fbdev) {
+    writel(fbdev->info->fix.smem_start, fbdev->base + PB0_BASE_ADDRESSOFFSET);
+    writel(fbdev->info->var.xres * fbdev->info->var.yres, \
+            fbdev->base + PB0_WORDS_ADDRESSOFFSET);
+    writel(fbdev->info->var.xres * fbdev->info->var.yres, \
+            fbdev->base + PB0_SAMPLES_ADDRESSOFFSET);
+    writel(fbdev->info->var.xres, fbdev->base + PB0_WIDTH_ADDRESSOFFSET);
+    writel(fbdev->info->var.yres, fbdev->base + PB0_HEIGHT_ADDRESSOFFSET);
+    writel(3, fbdev->base + PB0_INTERLACED_ADDRESSOFFSET);
+    writel(0, fbdev->base + PACKET_BANK_ADDRESSOFFSET);
+    //Go
+    writel(1, fbdev->base);
+
+    return 0;
+}
+
+/*
+ *  Initialization - General
+ */
+static struct altfb_type altfb_sgdma = {
+    .name = "SGDMA with video_sync_generator",
+    .of_setup = of_setup_sgdma,
+    .start_hw = start_sgdma_hw,
+};
+
+static struct altfb_type altfb_vipfr = {
+    .name = "ALTVIP FrameReader",
+    .of_setup = of_setup_vipfr,
+    .start_hw = start_vipfr_hw,
+};
+
+static struct of_device_id altfb_match[] = {
+	{ .compatible = "ALTR,altfb-12.1", .data = &altfb_sgdma },
+	{ .compatible = "ALTR,altfb-1.0",  .data = &altfb_sgdma },
+	{ .compatible = "ALTR,vip-frame-reader-9.1",  .data = &altfb_vipfr },
+	{},
+};
+MODULE_DEVICE_TABLE(of, altfb_match);
 
 static int __devinit altfb_probe(struct platform_device *pdev)
 {
 	struct fb_info *info;
-	struct resource *res;
 	int retval = -ENOMEM;
 	void *fbmem_virt;
-	u8 *desc_virt;
-	const __be32* val;
-	void *sgdma_base;
+    struct altfb_dev *fbdev;
+    const struct of_device_id *match;
+    
+    match = of_match_node(altfb_match, pdev->dev.of_node);
+    if(!match)
+        return -ENODEV;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res)
-	    return -ENODEV;
+    fbdev = kzalloc(sizeof(struct altfb_dev), GFP_KERNEL);
+    if(!fbdev)
+        return -ENOMEM;
+
+    fbdev->pdev = pdev;
+    fbdev->type = match->data;
+
+	fbdev->reg_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!fbdev->reg_res)
+	    goto err;
 
 	info = framebuffer_alloc(sizeof(u32) * 256, &pdev->dev);
 	if (!info)
 		goto err;
 
+    fbdev->info = info;
 	info->fbops = &altfb_ops;
 	info->var = altfb_default;
+	info->fix = altfb_fix;
+	
+    if(fbdev->type->of_setup(fbdev))
+        goto err1;
 
-	val = of_get_property(pdev->dev.of_node, "width", NULL);
-	if (!val) {
-		dev_err(&pdev->dev, "Missing required parameter 'width'");
-		return -ENODEV;
-	}
-
-	info->var.xres = be32_to_cpup(val),
-	info->var.xres_virtual = info->var.xres,
-
-	val = of_get_property(pdev->dev.of_node, "height", NULL);
-	if (!val) {
-		dev_err(&pdev->dev, "Missing required parameter 'height'");
-		return -ENODEV;
-	}
-
-	info->var.yres = be32_to_cpup(val);
-	info->var.yres_virtual = info->var.yres;
-
-	val = of_get_property(pdev->dev.of_node, "bpp", NULL);
-	if (!val) {
-		dev_err(&pdev->dev, "Missing required parameter 'bpp'");
-		return -ENODEV;
-	}
-
-	info->var.bits_per_pixel = be32_to_cpup(val);
-	if(info->var.bits_per_pixel == 24) {
-		dev_info(&pdev->dev, "BPP is set to 24. Using 32 to align to 16bit addresses");
-		info->var.bits_per_pixel = 32;
-	}
 	if(info->var.bits_per_pixel == 16) {
 		info->var.red.offset = 11;
 		info->var.red.length = 5;
@@ -292,20 +375,18 @@ static int __devinit altfb_probe(struct platform_device *pdev)
 		info->var.blue.length = 8;
 		info->var.blue.msb_right = 0;
 	}
-	info->fix = altfb_fix;
 	info->fix.line_length = (info->var.xres * (info->var.bits_per_pixel >> 3));
 	info->fix.smem_len = info->fix.line_length * info->var.yres;
 
 	/* sgdma descriptor table is located at the end of display memory */
 	fbmem_virt = dma_alloc_coherent(NULL,
-					info->fix.smem_len +
-					DISPLAY_DESC_SIZE(info->fix.smem_len),
+					info->fix.smem_len,
 					(void *)&(info->fix.smem_start),
 					GFP_KERNEL);
 	if (!fbmem_virt) {
 		dev_err(&pdev->dev, "altfb: unable to allocate %ld Bytes fb memory\n",
 			info->fix.smem_len + DISPLAY_DESC_SIZE(info->fix.smem_len));
-		return -ENOMEM;
+		goto err2;
 	}
 
 	info->screen_base = fbmem_virt;
@@ -317,67 +398,63 @@ static int __devinit altfb_probe(struct platform_device *pdev)
 	if (retval < 0)
 		goto err1;
 
-	platform_set_drvdata(pdev, info);
+	platform_set_drvdata(pdev, fbdev);
 
-	desc_virt = fbmem_virt;
-	desc_virt += info->fix.smem_len;
-
-	if (!request_mem_region(res->start, resource_size(res), pdev->name)) {
+	if (!request_mem_region(fbdev->reg_res->start, resource_size(fbdev->reg_res), pdev->name)) {
 		dev_err(&pdev->dev, "Memory region busy\n");
 		retval = -EBUSY;
-		goto err2;
-	}
-	sgdma_base = ioremap_nocache(res->start, resource_size(res));
-	if(!sgdma_base) {
-		retval = -EIO;
 		goto err3;
 	}
-	if (altfb_dma_start((unsigned long)sgdma_base, info->fix.smem_start, info->fix.smem_len, desc_virt))
+	fbdev->base = ioremap_nocache(fbdev->reg_res->start, resource_size(fbdev->reg_res));
+	if(!fbdev->base) {
+	    dev_err(&pdev->dev, "ioremap failed\n");
+		retval = -EIO;
 		goto err4;
-	iounmap(sgdma_base);
-	release_region(res->start, resource_size(res));
+	}
+	if (fbdev->type->start_hw(fbdev))
+		goto err5;
 
 	printk(KERN_INFO "fb%d: %s frame buffer device at 0x%x+0x%x\n",
 		info->node, info->fix.id, (unsigned)info->fix.smem_start,
 		info->fix.smem_len);
-	altfb_color_bar(info);
+
 	retval = register_framebuffer(info);
 	if (retval < 0)
-		goto err4;
+		goto err5;
 	return 0;
+err5:
+	iounmap(fbdev->base);
 err4:
-	iounmap(sgdma_base);
+	release_region(fbdev->reg_res->start, resource_size(fbdev->reg_res));
 err3:
-	release_region(res->start, resource_size(res));
+	dma_free_coherent(NULL, info->fix.smem_len, fbmem_virt,
+			  info->fix.smem_start);
 err2:
 	fb_dealloc_cmap(&info->cmap);
 err1:
 	framebuffer_release(info);
 err:
-	dma_free_coherent(NULL, altfb_fix.smem_len, fbmem_virt,
-			  altfb_fix.smem_start);
+    kfree(fbdev);
 	return retval;
 }
 
 static int __devexit altfb_remove(struct platform_device *dev)
 {
-	struct fb_info *info = platform_get_drvdata(dev);
+	struct altfb_dev *fbdev = platform_get_drvdata(dev);
 
-	if (info) {
-		unregister_framebuffer(info);
-		dma_free_coherent(NULL, info->fix.smem_len, info->screen_base,
-				  info->fix.smem_start);
-		framebuffer_release(info);
-	}
+    if (fbdev) {
+	    iounmap(fbdev->base);
+	    release_region(fbdev->reg_res->start, resource_size(fbdev->reg_res));
+	    if (fbdev->info) {
+		    unregister_framebuffer(fbdev->info);
+		    dma_free_coherent(NULL, fbdev->info->fix.smem_len, fbdev->info->screen_base,
+				      fbdev->info->fix.smem_start);
+		    framebuffer_release(fbdev->info);
+	    }
+	    kfree(fbdev);
+    }
 	return 0;
 }
-
-static struct of_device_id altfb_match[] = {
-	{ .compatible = "ALTR,altfb-12.1", },
-	{ .compatible = "ALTR,altfb-1.0", },
-	{},
-};
-MODULE_DEVICE_TABLE(of, altfb_match);
 
 static struct platform_driver altfb_driver = {
 	.probe = altfb_probe,
