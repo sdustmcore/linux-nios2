@@ -1,7 +1,7 @@
 /*
  * Ethtool support for Altera Triple-Speed Ethernet MAC driver
  *
- * Copyright (C) 2008 Altera Corporation
+ * Copyright (C) 2008-2013 Altera Corporation
  *
  * Contributors:
  *   Dalon Westergreen
@@ -79,8 +79,7 @@ static void tse_get_drvinfo(struct net_device *dev,
 	sprintf(info->bus_info, "AVALON");
 }
 
-/*
- * Fill in a buffer with the strings which correspond to the
+/* Fill in a buffer with the strings which correspond to the
  * stats
  */
 static void tse_gstrings(struct net_device *dev, u32 stringset, u8 *buf)
@@ -88,7 +87,8 @@ static void tse_gstrings(struct net_device *dev, u32 stringset, u8 *buf)
 	memcpy(buf, stat_gstrings, TSE_STATS_LEN * ETH_GSTRING_LEN);
 }
 
-static void tse_fill_stats(struct net_device *dev, struct ethtool_stats *dummy, u64 *buf)
+static void tse_fill_stats(struct net_device *dev, struct ethtool_stats *dummy,
+				u64 *buf)
 {
 	struct alt_tse_private *tse_priv = netdev_priv(dev);
 
@@ -153,17 +153,18 @@ static void tse_set_msglevel(struct net_device *dev, uint32_t data)
 
 static int tse_reglen(struct net_device *dev)
 {
-	return sizeof (struct alt_tse_private);
+	return sizeof(struct alt_tse_private);
 }
 
-static void tse_get_regs(struct net_device *dev, struct ethtool_regs *regs, void *regbuf)
+static void tse_get_regs(struct net_device *dev, struct ethtool_regs *regs,
+			void *regbuf)
 {
 	int i;
 	struct alt_tse_private *tse_priv = netdev_priv(dev);
 	u32 *tse_mac_regs = (u32 *) tse_priv;
 	u32 *buf = (u32 *) regbuf;
 
-	for (i = 0; i < sizeof (struct alt_tse_private) / sizeof (u32); i++)
+	for (i = 0; i < sizeof(struct alt_tse_private) / sizeof(u32); i++)
 		buf[i] = tse_mac_regs[i];
 }
 

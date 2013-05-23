@@ -4,7 +4,6 @@
 
 config NET_VENDOR_ALTERA
 	bool "Altera devices"
-	depends on NIOS2
 	---help---
 	  If you have a network (Ethernet) card belonging to this class, say Y.
 	  Make sure you know the name of your card. Read the Ethernet-HOWTO,
@@ -21,7 +20,6 @@ if NET_VENDOR_ALTERA
 
 config ALT_TSE
 	tristate "Altera Triple-Speed Ethernet MAC support"
-	depends on NIOS2
 	select PHYLIB
 	help
 	  This drivers supports the Altera Triple-Speed (TSE) Ethernet MAC.
